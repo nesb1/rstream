@@ -12,8 +12,10 @@ from rstream import (
     AMQPMessage,
     Consumer,
     ConsumerOffsetSpecification,
+    EventContext,
     FilterConfiguration,
     MessageContext,
+    OffsetSpecification,
     OffsetType,
     OnClosedErrorInfo,
     Producer,
@@ -356,6 +358,47 @@ async def test_consume_multiple_streams(consumer: Consumer, producer: Producer) 
     finally:
         await producer.close()
         await asyncio.gather(*(consumer.delete_stream(stream) for stream in streams))
+
+
+async def test_consume_with_sac_custom_consumer_update_listener_cb(
+    consumer: Consumer, producer: Producer
+) -> None:
+    stream_name = "stream"
+    await producer.create_stream(stream=stream_name)
+    try:
+        # necessary to use send_batch, since in this case, upon delivery, rabbitmq will deliver
+        # this batch as a whole, and not one message at a time, like send_wait
+        await producer.send_batch(stream_name, [AMQPMessage(body=f"{i}".encode()) for i in range(10)])
+
+        received_offsets = []
+
+        async def consumer_cb(message: bytes, message_context: MessageContext) -> None:
+            received_offsets.append(message_context.offset)
+
+        async def consumer_update_listener_with_custom_offset(
+            is_active: bool, event_context: EventContext
+        ) -> OffsetSpecification:
+            if is_active:
+                return OffsetSpecification(offset_type=OffsetType.OFFSET, offset=5)
+            return OffsetSpecification(offset_type=OffsetType.FIRST, offset=0)
+
+        properties = {"single-active-consumer": "true", "name": "sac_name"}
+        async with consumer:
+            await consumer.subscribe(
+                stream=stream_name,
+                callback=consumer_cb,
+                properties=properties,
+                offset_specification=ConsumerOffsetSpecification(OffsetType.FIRST),
+                consumer_update_listener=consumer_update_listener_with_custom_offset,
+            )
+
+            await wait_for(lambda: len(received_offsets) >= 1)
+
+            assert received_offsets[0] == 5
+
+    finally:
+        await producer.delete_stream(stream=stream_name)
+        await producer.close()
 
 
 async def test_consume_superstream_with_sac_all_active(
